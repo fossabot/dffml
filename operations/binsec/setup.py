@@ -64,6 +64,7 @@ setup(
     install_requires=INSTALL_REQUIRES,
     packages=find_packages(),
     entry_points={
+        "dffml.service.cli": ["binsec = dffml_operations_binsec.cli:BinSec",],
         "dffml.operation": [
             "url_to_urlbytes = dffml_operations_binsec.operations:URLToURLBytes",
             "urlbytes_to_tarfile = dffml_operations_binsec.operations:urlbytes_to_tarfile",
