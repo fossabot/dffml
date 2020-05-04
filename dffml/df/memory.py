@@ -56,6 +56,7 @@ from .base import (
     OperationImplementationNotInstantiable,
     BaseOperationImplementationNetworkContext,
     BaseOperationImplementationNetwork,
+    BaseOrchestratorContextConfig,
     BaseOrchestratorConfig,
     BaseOrchestratorContext,
     BaseOrchestrator,
@@ -1114,20 +1115,8 @@ class MemoryOrchestratorConfig(BaseOrchestratorConfig):
 
 
 @config
-class OrchestratorContextConfig:
-    dataflow: DataFlow
-    max_ctx: int = -1
-    max_concurrent: int = -1
-
-
-@config
-class MemoryOrchestratorContextConfig(OrchestratorContextConfig):
-    # Context objects to reuse. If not given a new context object will be created
-    rctx: BaseRedundancyCheckerContext = None
-    ictx: BaseInputNetworkContext = None
-    octx: BaseOperationNetworkContext = None
-    lctx: BaseLockNetworkContext = None
-    nctx: BaseOperationImplementationNetworkContext = None
+class MemoryOrchestratorContextConfig(BaseOrchestratorContextConfig):
+    pass
 
 
 class MemoryOrchestratorContext(BaseOrchestratorContext):
@@ -1180,11 +1169,6 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
         self._stack = await aenter_stack(self, enter)
         # Ensure that we can run the dataflow
         await self.initialize_dataflow(self.config.dataflow)
-        # Create a lock so we can track concurrent tasks under contexts and
-        # the number of contexts
-        self.lock = asyncio.Lock()
-        self.ctxs = self.max_ctxs
-        self.concurrent = self.max_concurrent
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
@@ -1360,25 +1344,27 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
         # TODO Make some way to cap the number of context's who have operations
         # executing. Or maybe just the number of operations. Or both.
         tasks = set()
+        # Track the number of contexts running
+        num_ctxs = 0
         # Create tasks to wait on the results of each of the contexts submitted
-        for ctx in ctxs:
+        for ctxs_index in range(0, len(ctxs)):
+            # Grab the context by it's index
+            ctx = ctxs[ctxs_index]
             self.logger.debug(
                 "kickstarting context: %s", (await ctx.handle()).as_string()
             )
-            if self.ctxs == -1:
-                tasks.add(
-                    asyncio.create_task(
-                        self.run_operations_for_ctx(ctx, strict=strict)
-                    )
+            tasks.add(
+                asyncio.create_task(
+                    self.run_operations_for_ctx(ctx, strict=strict)
                 )
-            else:
-                if self.ctxs > 0:
-                    tasks.add(
-                        asyncio.create_task(
-                            self.run_operations_for_ctx(ctx, strict=strict)
-                        )
-                    )
-                    self.ctxs -= 1
+            )
+            # Ensure we don't run more contexts conncurrently than requested
+            num_ctxs += 1
+            if (
+                self.config.max_ctxs is not None
+                and num_ctxs >= self.config.max_ctxs
+            ):
+                break
         try:
             # Return when outstanding operations reaches zero
             while tasks:
@@ -1390,6 +1376,7 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
                 for task in done:
                     # Remove the task from the set of tasks we are waiting for
                     tasks.remove(task)
+                    num_ctxs -= 1
                     # Get the tasks exception if any
                     exception = task.exception()
                     if strict and exception is not None:
@@ -1406,6 +1393,28 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
                         # output operations
                         ctx, results = task.result()
                         yield ctx, results
+                    # Create more tasks to wait on the results of each of the
+                    # contexts submitted if we are caping the number of them
+                    while (
+                        self.config.max_ctxs is not None
+                        and num_ctxs < self.config.max_ctxs
+                        and ctxs_index < len(ctxs)
+                    ):
+                        # Grab the context by it's index
+                        ctx = ctxs[ctxs_index]
+                        self.logger.debug(
+                            "kickstarting context: %s",
+                            (await ctx.handle()).as_string(),
+                        )
+                        tasks.add(
+                            asyncio.create_task(
+                                self.run_operations_for_ctx(ctx, strict=strict)
+                            )
+                        )
+                        # Keep track of which index we're at
+                        ctxs_index += 1
+                        # Ensure we don't run more contexts conncurrently than requested
+                        num_ctxs += 1
                 self.logger.debug("ctx.outstanding: %d", len(tasks) - 1)
         finally:
             # Cancel tasks which we don't need anymore now that we know we are done
