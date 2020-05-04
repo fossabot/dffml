@@ -1,18 +1,20 @@
 from dffml import CMD
 
+from .distro.clearlinux import ClearLinux
 
-class ClearLinux(CMD):
+
+class ClearLinuxCMD(CMD):
     async def run(self):
-        self.logger.debug(self)
+        return await ClearLinux().report()
 
 
-class Distro(CMD):
-    clearlinux = ClearLinux
+class DistroCMD(CMD):
+    clearlinux = ClearLinuxCMD
 
 
-class Scan(CMD):
-    distro = Distro
+class ScanCMD(CMD):
+    distro = DistroCMD
 
 
-class BinSec(CMD):
-    scan = Scan
+class BinSecCMD(CMD):
+    scan = ScanCMD
