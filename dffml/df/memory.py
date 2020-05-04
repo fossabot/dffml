@@ -60,7 +60,7 @@ from .base import (
     BaseOrchestratorContext,
     BaseOrchestrator,
 )
-
+from ..base import config
 from ..util.entrypoint import entrypoint
 from ..util.cli.arg import Arg
 from ..util.data import ignore_args
@@ -69,17 +69,15 @@ from ..util.asynchelper import aenter_stack, concurrently
 from .log import LOGGER
 
 
-class MemoryDataFlowObjectContextConfig(NamedTuple):
-    # Unique ID of the context, in other implementations this might be a JWT or
-    # something
-    uid: str
+class MemoryDataFlowObjectContextConfig:
+    """
+    Empty context for now
+    """
 
 
 class BaseMemoryDataFlowObject(BaseDataFlowObject):
     def __call__(self) -> BaseDataFlowObjectContext:
-        return self.CONTEXT(
-            MemoryDataFlowObjectContextConfig(uid=secrets.token_hex()), self
-        )
+        return self.CONTEXT(MemoryDataFlowObjectContextConfig(), self)
 
 
 class MemoryKeyValueStoreContext(BaseKeyValueStoreContext):
@@ -1115,12 +1113,21 @@ class MemoryOrchestratorConfig(BaseOrchestratorConfig):
     """
 
 
-class MemoryOrchestratorContextConfig(NamedTuple):
-    uid: str
+@config
+class OrchestratorContextConfig:
     dataflow: DataFlow
-    # Context objects to reuse. If not present in this dict a new context object
-    # will be created.
-    reuse: Dict[str, BaseDataFlowObjectContext]
+    max_ctx: int = -1
+    max_concurrent: int = -1
+
+
+@config
+class MemoryOrchestratorContextConfig(OrchestratorContextConfig):
+    # Context objects to reuse. If not given a new context object will be created
+    rctx: BaseRedundancyCheckerContext = None
+    ictx: BaseInputNetworkContext = None
+    octx: BaseOperationNetworkContext = None
+    lctx: BaseLockNetworkContext = None
+    nctx: BaseOperationImplementationNetworkContext = None
 
 
 class MemoryOrchestratorContext(BaseOrchestratorContext):
@@ -1133,6 +1140,7 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
         self._stack = None
         # Maps instance_name to OrchestratorContext
         self.subflows = {}
+        self.lock = None
 
     async def __aenter__(self) -> "BaseOrchestratorContext":
         # TODO(subflows) In all of these contexts we are about to enter, they
@@ -1158,16 +1166,25 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
         }
         # If we were told to reuse a context, don't enter it. Just set the
         # attribute now.
-        for name, ctx in self.config.reuse.items():
-            if name in enter:
+        remove = []
+        for name in enter:
+            ctx = getattr(self.config, name, None)
+            if ctx is not None:
+                remove.append(name)
                 self.logger.debug("Reusing %s: %s", name, ctx)
-                del enter[name]
                 setattr(self, name, ctx)
+        for name in remove:
+            del enter[name]
         # Creat the exit stack and enter all the contexts we won't be reusing
         self._stack = AsyncExitStack()
         self._stack = await aenter_stack(self, enter)
         # Ensure that we can run the dataflow
         await self.initialize_dataflow(self.config.dataflow)
+        # Create a lock so we can track concurrent tasks under contexts and
+        # the number of contexts
+        self.lock = asyncio.Lock()
+        self.ctxs = self.max_ctxs
+        self.concurrent = self.max_concurrent
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
@@ -1348,11 +1365,20 @@ class MemoryOrchestratorContext(BaseOrchestratorContext):
             self.logger.debug(
                 "kickstarting context: %s", (await ctx.handle()).as_string()
             )
-            tasks.add(
-                asyncio.create_task(
-                    self.run_operations_for_ctx(ctx, strict=strict)
+            if self.ctxs == -1:
+                tasks.add(
+                    asyncio.create_task(
+                        self.run_operations_for_ctx(ctx, strict=strict)
+                    )
                 )
-            )
+            else:
+                if self.ctxs > 0:
+                    tasks.add(
+                        asyncio.create_task(
+                            self.run_operations_for_ctx(ctx, strict=strict)
+                        )
+                    )
+                    self.ctxs -= 1
         try:
             # Return when outstanding operations reaches zero
             while tasks:
@@ -1631,14 +1657,16 @@ class MemoryOrchestrator(BaseOrchestrator, BaseMemoryDataFlowObject):
         await self._stack.aclose()
 
     def __call__(
-        self, dataflow: DataFlow, **kwargs
+        self,
+        dataflow: Union[DataFlow, MemoryOrchestratorContextConfig],
+        **kwargs,
     ) -> BaseDataFlowObjectContext:
-        return self.CONTEXT(
-            MemoryOrchestratorContextConfig(
-                uid=secrets.token_hex(), dataflow=dataflow, reuse=kwargs
-            ),
-            self,
-        )
+        config = dataflow
+        if isinstance(dataflow, DataFlow):
+            config = MemoryOrchestratorContextConfig(
+                dataflow=dataflow, **kwargs
+            )
+        return self.CONTEXT(config, self)
 
     @classmethod
     def args(cls, args, *above) -> Dict[str, Arg]:

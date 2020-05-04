@@ -4,7 +4,7 @@ from typing import AsyncIterator, Dict, NewType
 import aiohttp
 from bs4 import BeautifulSoup
 
-from dffml import run, DataFlow, Input, Associate
+from dffml import run, DataFlow, Input, Associate, OrchestratorContextConfig
 
 from .base import Distro, PackageURL, BinaryPath
 from ..operations import (
@@ -36,8 +36,12 @@ class ClearLinux(Distro):
         async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.get(self.PACKAGE_LIST_URL) as resp:
                 soup = BeautifulSoup(await resp.text(), features="html.parser")
+                i = 0
                 for link in soup.find_all("a", href=re.compile(".rpm")):
+                    i += 1
                     yield self.PACKAGE_LIST_URL + link["href"]
+                    if i > 50:
+                        break
 
     async def report(self) -> Dict[PackageURL, Dict[BinaryPath, bool]]:
         return {
@@ -45,7 +49,7 @@ class ClearLinux(Distro):
                 is_binary_pie.op.outputs["is_pie"].name
             ]
             async for ctx, results in run(
-                DATAFLOW,
+                OrchestratorContextConfig(DATAFLOW, max_concurrent=50),
                 {
                     url: [
                         Input(
@@ -62,6 +66,5 @@ class ClearLinux(Distro):
                     ]
                     async for url in self.packages()
                 },
-                config=OrchestratorContextConfig(max_concurrent=50,),
             )
         }
