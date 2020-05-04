@@ -1,10 +1,17 @@
 import re
+import os
 from typing import AsyncIterator, Dict, NewType
 
 import aiohttp
 from bs4 import BeautifulSoup
 
-from dffml import run, DataFlow, Input, Associate, OrchestratorContextConfig
+from dffml import (
+    run,
+    DataFlow,
+    Input,
+    Associate,
+    MemoryOrchestratorContextConfig,
+)
 
 from .base import Distro, PackageURL, BinaryPath
 from ..operations import (
@@ -28,12 +35,13 @@ DATAFLOW = DataFlow.auto(
 
 
 class ClearLinux(Distro):
-    PACKAGE_LIST_URL = (
-        "https://download.clearlinux.org/current/x86_64/os/Packages/"
+    PACKAGE_LIST_URL = os.environ.get(
+        "PACKAGE_LIST_URL",
+        "https://download.clearlinux.org/current/x86_64/os/Packages/",
     )
 
     async def packages(self) -> AsyncIterator[PackageURL]:
-        async with aiohttp.ClientSession(trust_env=True) as session:
+        async with aiohttp.ClientSession() as session:
             async with session.get(self.PACKAGE_LIST_URL) as resp:
                 soup = BeautifulSoup(await resp.text(), features="html.parser")
                 i = 0
@@ -45,16 +53,16 @@ class ClearLinux(Distro):
 
     async def report(self) -> Dict[PackageURL, Dict[BinaryPath, bool]]:
         return {
-            (await ctx.handle()).as_string(): results[
-                is_binary_pie.op.outputs["is_pie"].name
-            ]
+            (await ctx.handle()).as_string(): results.get(
+                is_binary_pie.op.outputs["is_pie"].name, {}
+            )
             async for ctx, results in run(
-                OrchestratorContextConfig(DATAFLOW, max_concurrent=50),
+                MemoryOrchestratorContextConfig(DATAFLOW, max_ctxs=25),
                 {
                     url: [
                         Input(
                             value=url,
-                            definition=url_to_urlbytes.inputs["URL"],
+                            definition=url_to_urlbytes.op.inputs["URL"],
                         ),
                         Input(
                             value=[
